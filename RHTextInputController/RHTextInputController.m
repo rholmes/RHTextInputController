@@ -3,7 +3,7 @@
 //  RHTextInputController
 //
 //  Created by Ryan Holmes on 11/18/12.
-//  Copyright (c) 2012 Ryan Holmes. All rights reserved.
+//  Copyright (c) 2012 Ryan Holmes and Olivier Larivain. All rights reserved.
 //
 
 #import "RHTextInputController.h"
@@ -14,12 +14,14 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 @interface UIView (FirstResponder)
 
 - (UIView *)findFirstResponder;
+- (BOOL)findAndResignFirstResponder;
 
 @end
 
 @implementation UIView (FirstResponder)
 
-- (UIView *) findFirstResponder {
+- (UIView *)findFirstResponder
+{
     if (self.isFirstResponder) {
         return self;
     }
@@ -33,43 +35,61 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
     return nil;
 }
 
+- (BOOL)findAndResignFirstResponder
+{
+	UIView *responder = [self findFirstResponder];
+	[responder resignFirstResponder];
+    
+    return responder != nil;
+}
+
+
 @end
 
-#pragma mark RHTextInputController
-@interface RHTextInputController ()
+#define DEFAULT_MARGIN 5.0f
 
-@property (strong, nonatomic) UITapGestureRecognizer *tapGestureRecognizer;
-@property (assign, nonatomic) CGSize mostRecentKeyboardSize;
-
-- (void)registerForKeyboardNotifications;
-- (void)unregisterForKeyboardNotifications;
-- (void)keyboardWillShow:(NSNotification *)aNotification;
-- (void)keyboardWillHide:(NSNotification *)aNotification;
-- (void)showActiveField:(UIView *)activeField;
-- (void)useDefaultInputAccessoryView:(BOOL)useDefault forField:(UIView *)field;
-- (void)updateFieldNavigationControlForActiveField:(UIView *)field;
-- (void)backgroundTapped;
+@interface RHTextInputController() {
+	// initialized to CGRectZero since clang 4.something
+	// so no need to explicitely initialize
+	CGRect _lastKeyboardRect;
+	CGRect _lastIntersection;
+	double _lastKeyboardAnimationDuration;
+	BOOL _didInsetScrollView;
+	BOOL _keyboardVisible;
+	BOOL _isTableView;
+}
 
 @end
 
 @implementation RHTextInputController
 
-#pragma mark - Initializers
-- (id)initWithScrollView:(UIScrollView *)scrollView
-{
-    self = [super init];
-    if (self) {
-        _scrollView = scrollView;
-        self.enabled = YES;
-    }
-    return self;
-}
-
-
-#pragma mark - NSObject methods
+#pragma mark - lifecycle
 - (void)awakeFromNib
 {
     self.enabled = YES;
+	self.margin = DEFAULT_MARGIN;
+    
+	if(self.nextPreviousSegmentedControl != nil) {
+		NSAssert(self.nextPreviousSegmentedControl.numberOfSegments == 2, @"Next/Previous Segmented control must have exactly 2 segments");
+	}
+	self.nextPreviousSegmentedControl.momentary = YES;
+}
+
+- (id) initWithScrollView:(UIScrollView *)scrollView
+			  inputFields:(NSArray *)inputFields
+	   inputAccessoryView:(UIView *)inputAccessoryView
+			 nextPrevious:(UISegmentedControl *)nextPrevious
+{
+	self = [super init];
+	if(self) {
+		self.margin = DEFAULT_MARGIN;
+		self.scrollView = scrollView;
+		self.textInputFields = inputFields;
+		self.defaultInputAccessoryView = inputAccessoryView;
+		self.nextPreviousSegmentedControl = nextPrevious;
+		self.enabled = YES;
+	}
+	return self;
 }
 
 - (void)dealloc
@@ -77,242 +97,332 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
     self.enabled = NO;
 }
 
-#pragma mark - IBAction methods
-- (IBAction)fieldNavigationTapped:(UISegmentedControl *)sender
+- (void)setScrollView:(UIScrollView *)scrollView
 {
-    NSUInteger fieldCount = self.textInputFields.count;
-    NSUInteger fieldIndex = [self.textInputFields indexOfObject:self.activeField];
-    if (fieldCount == 0 || fieldIndex == NSNotFound) {
-        return;
-    }
-    
-    NSInteger segmentIndex = [sender selectedSegmentIndex];
-    if (segmentIndex == 0) {
-        
-        // find the previous field index
-        if (fieldIndex > 0) {
-            fieldIndex--;
-        }
-    } else if (segmentIndex == 1) {
-        
-        // find the next field index
-        if (fieldIndex < fieldCount - 1) {
-            fieldIndex++;
-        }
-    }
-    
-    // make the new field active
-    UIView *field = [self.textInputFields objectAtIndex:fieldIndex];
-    [field becomeFirstResponder];
-    [self setActiveField:field];
+	_scrollView = scrollView;
+	_isTableView = [scrollView isKindOfClass:UITableView.class];
 }
 
-- (IBAction)inputDoneTapped:(id)sender {
-    [self.scrollView endEditing:YES];
-}
-
-
-#pragma mark - Public properties
-- (void)setActiveField:(UIView *)activeField
+- (void)setNextPreviousSegmentedControl:(UISegmentedControl *)nextPreviousSegmentedControl
 {
-    if (_activeField == activeField) {
-        return;
-    }
-    _activeField = activeField;
-    [self updateFieldNavigationControlForActiveField:activeField];
-    [self showActiveField:activeField];
+	_nextPreviousSegmentedControl = nextPreviousSegmentedControl;
+	_nextPreviousSegmentedControl.momentary = YES;
 }
 
 - (void)setEnabled:(BOOL)enabled
 {
-    // check if the property has changed
-    if (_enabled == enabled) {
+	// no change, abort
+	if(_enabled == enabled) {
+		return;
+	}
+    
+	// update the ivar
+    _enabled = enabled;
+    
+	// enable or disable the controller
+    if (enabled) {
+        if([self.scrollView isKindOfClass: UITableView.class] &&
+		   self.nextPreviousSegmentedControl != nil && self.delegate == nil) {
+			NSLog(@"[Text Input Controller] Warning: scroll view is a table and the delegate is not set, did you forget it? Next/Previous will be buggy.");
+		}
+        // set the default input accessory view for all connected fields
+        for (UIView *field in self.textInputFields) {
+            [self useDefaultInputAccessoryView:YES
+									  forField:field];
+        }
+        // register for keyboard events
+        [self registerForKeyboardNotifications];
+		return;
+    }
+    
+	// otherwise, do the oppose: unregister, unwire the input toolbar
+	[self unregisterForKeyboardNotifications];
+	for (UIView *field in self.textInputFields) {
+		[self useDefaultInputAccessoryView:NO
+								  forField:field];
+	}
+}
+
+#pragma mark - Making the current field visible
+- (void)makeFirstResponderVisible
+{
+	[self makeFirstResponderVisible:NO];
+}
+
+- (void)makeFirstResponderVisible:(BOOL)forced
+{
+	UIView *firstResponder = [self.scrollView findFirstResponder];
+	// no responder, no problem
+	// same thing if we don't have a keyboard size yet.
+	if(firstResponder == nil || CGRectEqualToRect(CGRectZero, _lastKeyboardRect ) ) {
+		return;
+	}
+    
+	// ok, so now, convert the last keyboard rect from its coordinate system to the scroll view's parent
+	// this will make getting the intersection between the keyboard and the scroll view easier.
+	// Note that the rect here actually contains the input accessory view. So we really just
+	// have to convert this guy to the scroll view's parent.
+	CGRect convertedKeyboardRect = [self.scrollView.window convertRect:_lastKeyboardRect
+																toView:self.scrollView.superview];
+    
+	// we might have to inset the scroll view/scroller indicator since something is showing up.
+	// The inset is actually exactly the intersection between the scroll view and the keyboard **in the scroll view's
+	// parent coordinate.** We don't care at all if the keyboard doesn't overlap our scroll view.
+	// It sounds stupid, but scroll views that don't extend to the bottom of the screen (think toolbar) or forms sheet
+	// on iPad will make the intersection smaller than keyboard height and will throw off everything down the line.
+	// No intersection, no inset.
+	// No inset... No inset!
+    
+	// This could be made more accurate by checking if the content size is smaller than the frame, but I've been getting
+	// mixed result with this approach - mostly because when that's the case, the content inset has to take the diff
+	// between content size and frame size into account. It's good enough for now we'll say.
+	_lastIntersection = CGRectIntersection(self.scrollView.frame, convertedKeyboardRect);
+    
+	// figure out where the active field is in scroll view coordinates
+	CGRect convertedFieldFrame = [firstResponder.superview convertRect:firstResponder.frame
+																toView:self.scrollView];
+	// and don't forget to shift by the content offset to bring this back to actual screen overlap
+	convertedFieldFrame = CGRectOffset(convertedFieldFrame, -self.scrollView.contentOffset.x, -self.scrollView.contentOffset.y);
+	// if the active field and the keyboard intersect, we have to change the content offset
+	BOOL updateContentOffset = CGRectIntersectsRect(convertedKeyboardRect, convertedFieldFrame) || (forced && [self.scrollView isKindOfClass: UITableView.class]);
+    
+	// make sure the next/previous buttons are properly enabled/disabled, if applicable
+	[self updateNextPreviousButtons];
+    
+	// we don't need to touch anything, call it a day.
+	if(_didInsetScrollView && !updateContentOffset) {
+		return;
+	}
+    
+	CGPoint contentOffset = self.scrollView.contentOffset;
+	if(updateContentOffset) {
+		// take the lowest point of the field + the margin, substract the visible part of the scroll view (i.e. scroll
+		// view height minus the intersection height).
+		// that's our new content offset! Yep, draw it on a piece of paper, if you don't believe me.
+		CGFloat visiblScrollViewHeight = self.scrollView.frame.size.height - _lastIntersection.size.height;
+		contentOffset.y = MAX(CGRectGetMaxY(convertedFieldFrame) + self.margin - visiblScrollViewHeight, 0);
+	}
+    
+	// copy then flip the updated content inset flag
+	BOOL updateContentInset = !_didInsetScrollView;
+	_didInsetScrollView = YES;
+    
+	void (^animations)() = ^{
+		if (updateContentInset) {
+			// if we should be insetting, add to the existing inset. We wouldn't want ot mess existing offset
+			// would we?
+			UIEdgeInsets inset = self.scrollView.contentInset;
+			inset.bottom += _lastIntersection.size.height;
+			self.scrollView.contentInset = inset;
+            
+			// the inset is the same for the scroll indicators
+			inset = self.scrollView.scrollIndicatorInsets;
+			inset.bottom += _lastIntersection.size.height;
+			self.scrollView.scrollIndicatorInsets = inset;
+		}
+        
+		// apply content offset only if needed
+		if (!updateContentOffset) {
+			return ;
+		}
+        
+		// scroll views are easy, just use the given content offset
+		if(!_isTableView || self.delegate == nil) {
+			[self.scrollView setContentOffset: contentOffset];
+			return;
+		}
+		// for tables, if the delegate gave us an index path, then scroll to that
+		NSIndexPath *indexPath = [self.delegate indexPathForResponder: firstResponder];
+		if(indexPath == nil) {
+			return;
+		}
+		[(UITableView *) self.scrollView scrollToRowAtIndexPath: indexPath
+											   atScrollPosition: UITableViewScrollPositionNone
+													   animated: NO];
+	};
+	[UIView animateWithDuration: _lastKeyboardAnimationDuration
+					 animations: animations];
+}
+
+#pragma mark - Dismissing the view
+- (IBAction)done:(id)sender
+{
+	[self.scrollView findAndResignFirstResponder];
+}
+
+#pragma mark - cycling through fields
+- (IBAction)nextPreviousTapped:(id)sender
+{
+	if(self.nextPreviousSegmentedControl.selectedSegmentIndex == 0) {
+		[self previous:sender];
+	} else {
+		[self next:sender];
+	}
+}
+
+- (IBAction)next:(id)sender
+{
+	// get the first responder
+	UIView *firstResponder = [self.scrollView findFirstResponder];
+	if(firstResponder == nil) {
+		return;
+	}
+    
+	// find the index
+	NSInteger index = [self.textInputFields indexOfObject:firstResponder];
+    NSInteger nextIndex = index + 1;
+    if (nextIndex >= [self.textInputFields count]) {
         return;
     }
     
-    // update the ivar
-    _enabled = enabled;
+	// grab the next field, make it first responder and scroll if needed
+	UIView *nextField = [self.textInputFields objectAtIndex:nextIndex];
+	[nextField becomeFirstResponder];
     
-    // enable or disable the controller
-    if (enabled) {
-        
-        // set the default input accessory view for all connected text fields
-        for (UIView *field in self.textInputFields) {
-            [self useDefaultInputAccessoryView:YES forField:field];
-        }
-        
-        // capture taps anywhere on the view's background
-        self.tapGestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:self
-                                                                            action:@selector(backgroundTapped)];
-        [self.tapGestureRecognizer setCancelsTouchesInView:NO];
-        [self.scrollView addGestureRecognizer:_tapGestureRecognizer];
-        
-        // register for keyboard events
-        [self registerForKeyboardNotifications];
-    } else {
-        [self unregisterForKeyboardNotifications];
-        [self.scrollView removeGestureRecognizer:self.tapGestureRecognizer];
-        
-        // unset the default input accessory view
-        for (UIView *field in self.textInputFields) {
-            [self useDefaultInputAccessoryView:NO forField:field];
-        }
-    }
+	[self makeFirstResponderVisible:YES];
 }
 
+- (IBAction)previous:(id)sender
+{
+	// get the first responder
+	UIView *firstResponder = [self.scrollView findFirstResponder];
+	if(firstResponder == nil) {
+		return;
+	}
+    
+	// find the index
+	NSInteger index = [self.textInputFields indexOfObject:firstResponder];
+    NSInteger previousIndex = index - 1;
+    if (previousIndex < 0 || previousIndex >= [self.textInputFields count]) {
+        return;
+    }
+    
+	// grab the previous field, make it first responder and scroll if needed
+	UIView *nextField = [self.textInputFields objectAtIndex:previousIndex];
+	[nextField becomeFirstResponder];
+    
+	[self makeFirstResponderVisible: YES];
+}
 
-#pragma mark - Private methods
+- (void)updateNextPreviousButtons
+{
+	UIView *firstResponder = [self.scrollView findFirstResponder];
+	NSInteger index = [self.textInputFields indexOfObject:firstResponder];
+    
+	// first segment is enabled if the index is beyond 0
+	[self.nextPreviousSegmentedControl setEnabled:index > 0
+								forSegmentAtIndex:0];
+	// next is enabled if we have one more element after the current one
+	[self.nextPreviousSegmentedControl setEnabled:index < (self.textInputFields.count - 1)
+								forSegmentAtIndex:1];
+}
+
+#pragma mark - Registering for keyboard events
 - (void)registerForKeyboardNotifications
 {
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(keyboardWillShow:)
-                                                 name:UIKeyboardWillShowNotification
-                                               object:nil];
+	// meh. Booor-iiiing!
+	NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self
+			   selector:@selector(keyboardWillShow:)
+				   name:UIKeyboardWillShowNotification
+				 object:nil];
     
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(keyboardWillHide:)
-                                                 name:UIKeyboardWillHideNotification
-                                               object:nil];
+    [center addObserver:self
+			   selector:@selector(keyboardWillHide:)
+				   name:UIKeyboardWillHideNotification
+				 object:nil];
 }
 
 - (void)unregisterForKeyboardNotifications
 {
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:UIKeyboardWillShowNotification
-                                                  object:nil];
+	// Yawn.
+	NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self
+					  name:UIKeyboardWillShowNotification
+					object:nil];
     
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:UIKeyboardWillHideNotification
-                                                  object:nil];
+    [center removeObserver:self
+					  name:UIKeyboardWillHideNotification
+					object:nil];
 }
 
-// Called when the UIKeyboardWillShowNotification is sent.
-- (void)keyboardWillShow:(NSNotification *)aNotification
+#pragma mark - Responding to keyboard notifications
+- (void) keyboardWillShow:(NSNotification *)notification
 {
-    // Get the size of the keyboard
-    NSDictionary* info = [aNotification userInfo];
-    CGSize kbSize = [[info objectForKey:UIKeyboardFrameEndUserInfoKey] CGRectValue].size;
-    self.mostRecentKeyboardSize = kbSize;
+	CGRect newRect = [[notification.userInfo objectForKey: UIKeyboardFrameEndUserInfoKey] CGRectValue];
+	CGRect convertedNewKeyboardRect = [self.scrollView.window convertRect:newRect
+																   toView:self.scrollView.superview];
     
-    self.activeField = [self.scrollView findFirstResponder];
+	CGRect convertedKeyboardRect = [self.scrollView.window convertRect:_lastKeyboardRect
+																toView:self.scrollView.superview];
+	if(convertedNewKeyboardRect.size.height != convertedKeyboardRect.size.height) {
+		[self removeContentInset: 0.0f clearLastKeyboardRect: NO];
+		_didInsetScrollView = NO;
+	}
+    
+	// copy the target keyboard rect and the animation duration over
+	_lastKeyboardRect = newRect;
+	_lastKeyboardAnimationDuration = [[notification.userInfo objectForKey:UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    
+	[self makeFirstResponderVisible];
+	_keyboardVisible = YES;
 }
 
-
-// Called when the UIKeyboardWillHideNotification is sent
-- (void)keyboardWillHide:(NSNotification *)aNotification
-{
-    [UIView animateWithDuration:ANIMATION_DURATION animations:^{
-        UIScrollView *scrollView = self.scrollView;
-        scrollView.contentInset = UIEdgeInsetsZero;
-        scrollView.scrollIndicatorInsets = UIEdgeInsetsZero;
-        scrollView.contentOffset = CGPointZero;
-
-    }];
-    
-    _activeField = nil;
+- (void) keyboardWillHide: (NSNotification *) notification {
+	double duration = [[notification.userInfo objectForKey:UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+	[self removeContentInset: duration clearLastKeyboardRect:YES];
 }
 
-- (void)showActiveField:(UIView *)activeField
+- (void) removeContentInset:(double)duration clearLastKeyboardRect:(BOOL)clearLastKeyboardRect
 {
-    // Can't do anything without an active field
-    if (!activeField) {
-        return;
-    }
     
-    UIScrollView *scrollView = self.scrollView;
-    
-    // Get the size of the keyboard or input view
-    CGSize kbSize = self.mostRecentKeyboardSize;
-    if (activeField.inputView) {
-        kbSize = activeField.inputView.frame.size;
+	// unset the content inset and such
+	void (^animations)() = ^{
+		// un-apply the inset modification we made in -showCurrentField
+		UIEdgeInsets inset = self.scrollView.contentInset;
+		inset.bottom -= _lastIntersection.size.height;
+        self.scrollView.contentInset = inset;
         
-        // Add the input accessory view's height to the keyboard size
-        UIView *inputAccView = [activeField inputAccessoryView];
-        CGSize accSize = inputAccView ? inputAccView.frame.size : CGSizeZero;
-        kbSize.height += accSize.height;
-    }
+		inset = self.scrollView.scrollIndicatorInsets;
+		inset.bottom -= _lastIntersection.size.height;
+        self.scrollView.scrollIndicatorInsets = inset;
+    };
     
-    // Add a gap between the bottom of the active field and the keyboard
-    kbSize.height += 2.0f;
+	void(^completion)(BOOL) = ^(BOOL finished) {
+		if(!clearLastKeyboardRect) {
+			return ;
+		}
+		// clear the keyboard and copy the animation duration, we don't want stale data hanging around
+		_lastKeyboardRect = CGRectZero;
+		_lastIntersection = CGRectZero;
+		_lastKeyboardAnimationDuration = 0.0f;
+	};
     
-    // Adjust content insets to make space for the keyboard
-    BOOL needsContentInsets = NO;
-    UIEdgeInsets contentInsets = UIEdgeInsetsMake(0.0, 0.0, kbSize.height, 0.0);
-    if (scrollView.contentInset.bottom != kbSize.height) {
-        needsContentInsets = YES;
-    }
-    
-    // If active field is hidden by the keyboard, scroll so it's visible
-    BOOL needsContentOffset = NO;
-    CGRect aRect = scrollView.frame;
-    aRect.size.height -= kbSize.height;
-    CGRect frame = [scrollView convertRect:activeField.frame fromView:activeField.superview];
-    CGPoint scrollPoint = CGPointZero;
-    if (!CGRectContainsRect(aRect, frame) ) {
-        scrollPoint = CGPointMake(0.0, frame.origin.y + frame.size.height - (aRect.size.height));
-        if (scrollPoint.y > 0.0) {
-            needsContentOffset = YES;
-        }
-    }
-    
-    // Perform animations
-    if (needsContentInsets || needsContentOffset) {
-        [UIView animateWithDuration:ANIMATION_DURATION animations:^{
-            if (needsContentInsets) {
-                scrollView.contentInset = contentInsets;
-                scrollView.scrollIndicatorInsets = contentInsets;
-            }
-            
-            if (needsContentOffset) {
-                [scrollView setContentOffset: scrollPoint];
-            }
-        }];
-    }
-    
+    [UIView animateWithDuration:duration
+					 animations:animations
+					 completion:completion];
 }
 
-- (void)updateFieldNavigationControlForActiveField:(UIView *)field
-{
-    NSUInteger fieldCount = self.textInputFields.count;
-    NSUInteger index = [self.textInputFields indexOfObject:field];
-    
-    BOOL previousEnabled = NO;
-    BOOL nextEnabled = NO;
-    if (fieldCount > 0 && index != NSNotFound) {
-        previousEnabled = index > 0;
-        nextEnabled = index < (fieldCount - 1);
-    }
-    
-    
-    [self.fieldNavigationControl setEnabled:previousEnabled forSegmentAtIndex:0];
-    [self.fieldNavigationControl setEnabled:nextEnabled forSegmentAtIndex:1];
-}
 
+#pragma mark - Injecting the default accessory view
 - (void)useDefaultInputAccessoryView:(BOOL)useDefault forField:(UIView *)field
 {
-    // set or unset the default input accessory view for the given field
-    if ([field isKindOfClass:[UITextField class]]) {
-        UITextField *tf = (UITextField *)field;
-        if (useDefault && !tf.inputAccessoryView) {
-            tf.inputAccessoryView = self.defaultInputAccessoryView;
-        }
-        if (!useDefault && tf.inputAccessoryView == self.defaultInputAccessoryView) {
-            tf.inputAccessoryView = nil;
-        }
-    } else if ([field isKindOfClass:[UITextView class]]) {
-        UITextView *tv = (UITextView *)field;
-        if (useDefault && !tv.inputAccessoryView) {
-            tv.inputAccessoryView = self.defaultInputAccessoryView;
-        }
-        if (!useDefault && tv.inputAccessoryView == self.defaultInputAccessoryView) {
-            tv.inputAccessoryView = nil;
-        }
-    }
-}
-
-- (void)backgroundTapped
-{
-    [self.scrollView endEditing:YES];
+	// does the field allow for overriding the accessory view?
+	if(![field respondsToSelector:@selector(setInputAccessoryView:)]) {
+		return;
+	}
+    
+	// get a reference to the current accessory view
+	UIView *existingInputAccessoryView = field.inputAccessoryView;
+    
+	// set or unset the field's input accessory view
+	// do not touch the existing input accessory view, unless it's either not set or ours
+	if (useDefault && existingInputAccessoryView == nil) {
+		[field performSelector:@selector(setInputAccessoryView:) withObject:self.defaultInputAccessoryView];
+	}
+	if (!useDefault && existingInputAccessoryView == self.defaultInputAccessoryView) {
+		[field performSelector:@selector(setInputAccessoryView:) withObject:nil];
+	}
 }
 
 
