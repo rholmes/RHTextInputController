@@ -146,8 +146,10 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 		return;
     }
     
-	// otherwise, do the oppose: unregister, unwire the input toolbar
+	// otherwise, do the oppose: unregister, unwire the gesture recognizer
+    // and input toolbar
 	[self unregisterForKeyboardNotifications];
+    [self.scrollView removeGestureRecognizer:_tapGestureRecognizer];
 	for (UIView *field in self.textInputFields) {
 		[self useDefaultInputAccessoryView:NO
 								  forField:field];
@@ -390,7 +392,6 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 
 - (void)removeContentInset:(double)duration clearLastKeyboardRect:(BOOL)clearLastKeyboardRect
 {
-    
 	// unset the content inset and such
 	void (^animations)() = ^{
 		// un-apply the inset modification we made in -showCurrentField
@@ -418,8 +419,8 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 					 completion:completion];
 }
 
-
 #pragma mark - Injecting the default accessory view
+
 - (void)useDefaultInputAccessoryView:(BOOL)useDefault forField:(UIView *)field
 {
 	// does the field allow for overriding the accessory view?
@@ -440,5 +441,11 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 	}
 }
 
+#pragma mark - Gesture recognizer
+
+- (void)backgroundTapped
+{
+    [self.scrollView endEditing:YES];
+}
 
 @end
