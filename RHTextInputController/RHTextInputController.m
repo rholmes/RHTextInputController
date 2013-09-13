@@ -57,7 +57,10 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 	BOOL _didInsetScrollView;
 	BOOL _keyboardVisible;
 	BOOL _isTableView;
+    BOOL _isAnimating;
+    UITapGestureRecognizer *_tapGestureRecognizer;
 }
+
 
 @end
 
@@ -125,11 +128,19 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 		   self.nextPreviousSegmentedControl != nil && self.delegate == nil) {
 			NSLog(@"[Text Input Controller] Warning: scroll view is a table and the delegate is not set, did you forget it? Next/Previous will be buggy.");
 		}
+        
         // set the default input accessory view for all connected fields
         for (UIView *field in self.textInputFields) {
             [self useDefaultInputAccessoryView:YES
 									  forField:field];
         }
+        
+        // capture taps anywhere on the view's background
+        _tapGestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                        action:@selector(backgroundTapped)];
+        [_tapGestureRecognizer setCancelsTouchesInView:NO];
+        [self.scrollView addGestureRecognizer:_tapGestureRecognizer];
+
         // register for keyboard events
         [self registerForKeyboardNotifications];
 		return;
@@ -154,7 +165,7 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 	UIView *firstResponder = [self.scrollView findFirstResponder];
 	// no responder, no problem
 	// same thing if we don't have a keyboard size yet.
-	if(firstResponder == nil || CGRectEqualToRect(CGRectZero, _lastKeyboardRect ) ) {
+	if(firstResponder == nil || CGRectEqualToRect(CGRectZero, _lastKeyboardRect ) || _isAnimating) {
 		return;
 	}
     
@@ -181,8 +192,6 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 	// figure out where the active field is in scroll view coordinates
 	CGRect convertedFieldFrame = [firstResponder.superview convertRect:firstResponder.frame
 																toView:self.scrollView];
-	// and don't forget to shift by the content offset to bring this back to actual screen overlap
-	convertedFieldFrame = CGRectOffset(convertedFieldFrame, -self.scrollView.contentOffset.x, -self.scrollView.contentOffset.y);
 	// if the active field and the keyboard intersect, we have to change the content offset
 	BOOL updateContentOffset = CGRectIntersectsRect(convertedKeyboardRect, convertedFieldFrame) || (forced && [self.scrollView isKindOfClass: UITableView.class]);
     
@@ -236,12 +245,17 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 		if(indexPath == nil) {
 			return;
 		}
-		[(UITableView *) self.scrollView scrollToRowAtIndexPath: indexPath
-											   atScrollPosition: UITableViewScrollPositionNone
-													   animated: NO];
+		[(UITableView *) self.scrollView scrollToRowAtIndexPath:indexPath
+											   atScrollPosition:UITableViewScrollPositionNone
+													   animated:NO];
 	};
-	[UIView animateWithDuration: _lastKeyboardAnimationDuration
-					 animations: animations];
+    
+	_isAnimating = YES;
+	[UIView animateWithDuration:_lastKeyboardAnimationDuration
+					 animations:animations
+					 completion:^(BOOL finished) {
+						 _isAnimating = NO;
+					 }];
 }
 
 #pragma mark - Dismissing the view
@@ -368,12 +382,13 @@ static const CGFloat ANIMATION_DURATION = 0.27f;
 	_keyboardVisible = YES;
 }
 
-- (void) keyboardWillHide: (NSNotification *) notification {
+- (void)keyboardWillHide:(NSNotification *)notification
+{
 	double duration = [[notification.userInfo objectForKey:UIKeyboardAnimationDurationUserInfoKey] doubleValue];
 	[self removeContentInset: duration clearLastKeyboardRect:YES];
 }
 
-- (void) removeContentInset:(double)duration clearLastKeyboardRect:(BOOL)clearLastKeyboardRect
+- (void)removeContentInset:(double)duration clearLastKeyboardRect:(BOOL)clearLastKeyboardRect
 {
     
 	// unset the content inset and such
